@@ -1,0 +1,163 @@
+name: Monitor DOU - Contratação ENCCEJA
+
+on:
+  schedule:
+    - cron: '0 12 * * *'  # 09h Brasília (UTC-3)
+  workflow_dispatch:       # Permite disparo manual para testes
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Buscar DOU e verificar publicações do ENCCEJA
+        id: check
+        run: |
+          python3 - <<'PYEOF'
+          import urllib.request
+          import urllib.parse
+          import re
+          import os
+          import sys
+
+          SEARCH_URL = (
+            "https://www.in.gov.br/consulta/-/buscar/dou"
+            "?q=encceja&s=todos&exactDate=all&sortType=0&delta=20"
+            "&orgPrin=Minist%C3%A9rio+da+Educa%C3%A7%C3%A3o"
+            "&orgSub=Instituto+Nacional+de+Estudos+e+Pesquisas"
+            "+Educacionais+An%C3%ADsio+Teixeira"
+          )
+
+          RSS_URLS = [
+            "https://www.in.gov.br/servicos/do3-feed-rss",  # Seção 3: contratos/editais
+            "https://www.in.gov.br/servicos/do1-feed-rss",  # Seção 1: atos normativos
+            "https://www.in.gov.br/servicos/dou-extra-feed-rss",
+          ]
+
+          KEYWORDS = [
+            "encceja", "contrat", "licitaç", "homologaç",
+            "empresa", "adjudicaç", "pregão", "dispensa",
+            "fornecedor", "executor"
+          ]
+
+          headers = {
+            "User-Agent": (
+              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+            "Referer": "https://www.in.gov.br/",
+          }
+
+          def fetch(url):
+            try:
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read().decode("utf-8", errors="replace")
+            except Exception as e:
+              print(f"Erro ao buscar {url}: {e}", file=sys.stderr)
+              return ""
+
+          def strip_tags(html):
+            text = re.sub(r"<[^>]+>", " ", html)
+            return re.sub(r"\s+", " ", text).strip()
+
+          def has_encceja_contract(text):
+            lower = text.lower()
+            has_encceja = "encceja" in lower
+            has_contract = any(k in lower for k in [
+              "contrat", "licitaç", "homologaç", "adjudicaç",
+              "pregão", "dispensa", "empresa", "executor", "fornecedor"
+            ])
+            return has_encceja and has_contract
+
+          def extract_snippets(text, max_snippets=15):
+            sentences = re.split(r'(?<=[.;])\s+', text)
+            snippets = []
+            for s in sentences:
+              if "encceja" in s.lower() and len(s.strip()) > 40:
+                snippets.append(s.strip())
+            return snippets[:max_snippets]
+
+          found_items = []
+
+          # 1. Busca principal (página de busca do DOU)
+          print("Buscando na página principal do DOU...", file=sys.stderr)
+          html = fetch(SEARCH_URL)
+          if html:
+            text = strip_tags(html)
+            if has_encceja_contract(text):
+              snippets = extract_snippets(text)
+              if snippets:
+                found_items.append(("Página de Busca DOU", "\n".join(snippets)))
+
+          # 2. Feeds RSS (Seções 1, 3 e Extra)
+          for rss_url in RSS_URLS:
+            print(f"Buscando RSS: {rss_url}", file=sys.stderr)
+            rss = fetch(rss_url)
+            if not rss:
+              continue
+            # Extrai itens do RSS
+            items = re.findall(r"<item>(.*?)</item>", rss, re.DOTALL)
+            for item in items:
+              item_text = strip_tags(item)
+              if has_encceja_contract(item_text):
+                title_m = re.search(r"<title>(.*?)</title>", item)
+                title = strip_tags(title_m.group(1)) if title_m else "(sem título)"
+                date_m = re.search(r"<pubDate>(.*?)</pubDate>", item)
+                date = date_m.group(1) if date_m else ""
+                link_m = re.search(r"<link>(.*?)</link>", item)
+                link = link_m.group(1) if link_m else ""
+                found_items.append((
+                  f"{title} ({date})",
+                  f"Link: {link}\n{item_text[:600]}"
+                ))
+
+          env_file = os.environ.get("GITHUB_OUTPUT", "/dev/stdout")
+          with open(env_file, "a") as f:
+            if found_items:
+              f.write("FOUND=true\n")
+              body_lines = []
+              for title, content in found_items:
+                body_lines.append(f"=== {title} ===")
+                body_lines.append(content)
+                body_lines.append("")
+              body = "\n".join(body_lines)
+              # Escreve conteúdo como variável multiline
+              f.write("CONTENT<<ENDOFBODY\n")
+              f.write(body[:8000])
+              f.write("\nENDOFBODY\n")
+              print("ENCONTRADO: publicações relevantes!", file=sys.stderr)
+            else:
+              f.write("FOUND=false\n")
+              print("Nenhuma publicação de contratação encontrada hoje.", file=sys.stderr)
+          PYEOF
+
+      - name: Enviar e-mail de alerta
+        if: steps.check.outputs.FOUND == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USERNAME }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: "Monitor DOU ENCCEJA <${{ secrets.GMAIL_USERNAME }}>"
+          subject: "[ALERTA] DOU: Publicação sobre contratação do ENCCEJA encontrada"
+          body: |
+            Olá,
+
+            Uma publicação relevante sobre a contratação do ENCCEJA foi detectada
+            no Diário Oficial da União.
+
+            ─────────────────────────────────────────────
+            ${{ steps.check.outputs.CONTENT }}
+            ─────────────────────────────────────────────
+
+            Acesse a busca completa:
+            https://www.in.gov.br/consulta/-/buscar/dou?q=encceja&s=todos&exactDate=all&sortType=0&delta=20&orgPrin=Minist%C3%A9rio+da+Educa%C3%A7%C3%A3o&orgSub=Instituto+Nacional+de+Estudos+e+Pesquisas+Educacionais+An%C3%ADsio+Teixeira
+
+            —
+            Monitor automático DOU · GitHub Actions
